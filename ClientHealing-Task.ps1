@@ -411,8 +411,32 @@ function Invoke-CleanUninstall {
         }
 
         $exitCode = $proc.ExitCode
-        if ($exitCode -eq 0) { Write-Log "Uninstall completed (exit code 0)" "SUCCESS" }
-        else { Write-Log "Uninstall exit code: $exitCode" "WARN" }
+        if ($exitCode -eq 0) { Write-Log "Uninstall bootstrapper exited (exit code 0)" "SUCCESS" }
+        else { Write-Log "Uninstall bootstrapper exit code: $exitCode" "WARN" }
+
+        # ccmsetup.exe /uninstall is a two-stage process: the bootstrapper exits
+        # quickly but spawns a child process that does the actual uninstall.
+        # Wait for ALL ccmsetup.exe processes to finish before proceeding.
+        Write-Log "Waiting for background uninstall to complete..." "INFO"
+        $bgTimeout = 300
+        $bgElapsed = 0
+        while ($bgElapsed -lt $bgTimeout) {
+            $ccmProcs = Get-Process -Name "ccmsetup" -ErrorAction SilentlyContinue
+            if (-not $ccmProcs) { break }
+            Start-Sleep -Seconds 10
+            $bgElapsed += 10
+            if ($bgElapsed % 60 -eq 0) {
+                Write-Log "Background uninstall still running ($bgElapsed s)..." "INFO"
+            }
+        }
+
+        if ($bgElapsed -ge $bgTimeout) {
+            Write-Log "Background uninstall did not finish within $bgTimeout seconds -- forcing kill" "WARN"
+            Get-Process -Name "ccmsetup" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        } else {
+            Write-Log "Uninstall fully completed ($bgElapsed s wait)" "SUCCESS"
+        }
+
         return ($exitCode -eq 0)
     } catch {
         Write-Log "Uninstall failed: $($_.Exception.Message)" "ERROR"
