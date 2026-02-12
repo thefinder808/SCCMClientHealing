@@ -1,0 +1,960 @@
+<#
+.SYNOPSIS
+    SCCM Client Healing Script -- Scheduled Task Edition
+
+.DESCRIPTION
+    Self-healing, self-retiring remediation agent designed to run as a
+    GPO-deployed scheduled task. Fires on startup AND daily, performs the same
+    deep diagnostic, cleanup, and reinstallation as the GPO startup script,
+    but tracks consecutive healthy checks via a JSON state file and
+    auto-removes itself after the client has been confirmed healthy N times
+    in a row.
+
+    Key differences from the GPO startup edition:
+      - Runs as a scheduled task (startup + daily) instead of GPO startup script
+      - JSON state file tracks consecutive successes across runs
+      - Auto-removes the scheduled task after N consecutive healthy checks
+      - No marker file -- state file replaces it
+      - All output goes to a log file (no Write-Host)
+      - Runs as SYSTEM via scheduled task (no admin check needed)
+      - Start-Transcript as a safety net
+
+.NOTES
+    DEPLOYMENT VIA GPO PREFERENCES:
+    ================================
+    1. Place this script on a share readable by Domain Computers
+       (e.g. \\domain.com\NETLOGON\Scripts\ClientHealing-Task.ps1)
+
+    2. Ensure the ClientSource share is also readable by Domain Computers
+
+    3. Open Group Policy Management, create/edit a GPO linked to
+       the OU containing affected workstations
+
+    4. Navigate to:
+       Computer Configuration > Preferences > Control Panel Settings > Scheduled Tasks
+
+    5. Right-click > New > Scheduled Task (At least Windows 7)
+
+    6. General tab:
+       - Name: "SCCM Client Healing"  (must match $ScheduledTaskName in script)
+       - Run as: NT AUTHORITY\SYSTEM
+       - Run with highest privileges: checked
+       - Configure for: Windows 7 / Windows Server 2008 R2 (or later)
+
+    7. Triggers tab -- add TWO triggers:
+       a. At startup -- Delay task for: 5 minutes
+       b. Daily -- At a fixed time (e.g. 13:00), repeat every 1 day
+          Optionally: enable "Delay task for up to (random delay): 1 hour"
+          to avoid all machines hitting the share simultaneously
+
+    8. Actions tab:
+       - Action: Start a program
+       - Program: powershell.exe
+       - Arguments: -ExecutionPolicy Bypass -NoProfile -NonInteractive -File "\\path\to\ClientHealing-Task.ps1"
+
+    9. Settings tab:
+       - Allow task to be run on demand: checked
+       - Stop the task if it runs longer than: 30 minutes
+       - If the task is already running: Do not start a new instance
+
+    10. REMOVAL: Once all clients are healed, the task auto-removes itself.
+        Remove the GPO link to stop deploying to new machines.
+        If a machine was missed, GPO will re-create the task on next gpupdate.
+
+    TESTING:
+    ========
+    Test by running as SYSTEM before GPO deployment:
+      psexec -s powershell.exe -ExecutionPolicy Bypass -File "\\path\to\ClientHealing-Task.ps1"
+
+    Verify state file is created/updated after each run.
+    Verify auto-removal: set $ConsecutiveSuccessThreshold = 1 on a healthy
+    machine, run once -- task should unregister itself.
+#>
+
+# ===== CONFIGURATION - EDIT THESE VALUES =====================================
+$SiteCode                    = "YOURSITECODE"
+$ManagementPoint             = "YOURMP.domain.com"
+$ClientSource                = "\\SERVER\Share\Client"
+$LogPath                     = "$env:SystemRoot\Temp\SCCMHealing-Task.log"
+$StateFile                   = "$env:SystemRoot\Temp\SCCMHealing-Task.state"
+$MaxRetries                  = 3          # Network path retry attempts
+$RetryDelaySec               = 30         # Seconds between retries
+$ConsecutiveSuccessThreshold = 3          # Auto-remove after this many consecutive healthy checks
+$ScheduledTaskName           = "SCCM Client Healing"   # Must match the name in GPO Preferences
+$ScheduledTaskPath           = "\"                      # Root of Task Scheduler
+# =============================================================================
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# ============================================================================
+#  LOGGING
+# ============================================================================
+
+function Write-Log {
+    param(
+        [string]$Message,
+        [ValidateSet("INFO","WARN","ERROR","SUCCESS","PHASE")]
+        [string]$Level = "INFO"
+    )
+    $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "[$ts] [$Level] $Message"
+    Add-Content -Path $LogPath -Value $entry -ErrorAction SilentlyContinue
+}
+
+# ============================================================================
+#  STATE FILE MANAGEMENT
+# ============================================================================
+
+function Read-State {
+    $default = @{
+        ConsecutiveSuccesses = 0
+        LastCheckTime        = $null
+        LastHealTime         = $null
+        LastHealthScore      = 0
+        ClientVersion        = $null
+        TotalRuns            = 0
+        TotalHeals           = 0
+    }
+
+    if (-not (Test-Path $StateFile)) {
+        Write-Log "State file not found -- initializing fresh state" "INFO"
+        return $default
+    }
+
+    try {
+        $raw = Get-Content -Path $StateFile -Raw -ErrorAction Stop
+        $state = $raw | ConvertFrom-Json
+        # Validate expected properties exist, fill in missing ones
+        $result = @{
+            ConsecutiveSuccesses = if ($null -ne $state.ConsecutiveSuccesses) { [int]$state.ConsecutiveSuccesses } else { 0 }
+            LastCheckTime        = $state.LastCheckTime
+            LastHealTime         = $state.LastHealTime
+            LastHealthScore      = if ($null -ne $state.LastHealthScore) { [int]$state.LastHealthScore } else { 0 }
+            ClientVersion        = $state.ClientVersion
+            TotalRuns            = if ($null -ne $state.TotalRuns) { [int]$state.TotalRuns } else { 0 }
+            TotalHeals           = if ($null -ne $state.TotalHeals) { [int]$state.TotalHeals } else { 0 }
+        }
+        Write-Log "State loaded: ConsecutiveSuccesses=$($result.ConsecutiveSuccesses), TotalRuns=$($result.TotalRuns), TotalHeals=$($result.TotalHeals)" "INFO"
+        return $result
+    } catch {
+        Write-Log "State file corrupt or unreadable -- reinitializing: $($_.Exception.Message)" "WARN"
+        return $default
+    }
+}
+
+function Write-State {
+    param([hashtable]$State)
+
+    try {
+        $json = $State | ConvertTo-Json -Depth 2
+        Set-Content -Path $StateFile -Value $json -Force -ErrorAction Stop
+        Write-Log "State written: ConsecutiveSuccesses=$($State.ConsecutiveSuccesses), LastHealthScore=$($State.LastHealthScore)" "INFO"
+    } catch {
+        Write-Log "Failed to write state file: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+# ============================================================================
+#  NETWORK WAIT
+# ============================================================================
+
+function Wait-ForNetwork {
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        $sourcePath = Join-Path $ClientSource "ccmsetup.exe"
+        if (Test-Path $sourcePath) {
+            Write-Log "Client source accessible: $sourcePath (attempt $attempt)" "SUCCESS"
+            return $true
+        }
+        Write-Log "Client source not reachable (attempt $attempt of $MaxRetries). Waiting $RetryDelaySec seconds..." "WARN"
+        Start-Sleep -Seconds $RetryDelaySec
+    }
+    Write-Log "Client source unreachable after $MaxRetries attempts. Exiting." "ERROR"
+    return $false
+}
+
+# ============================================================================
+#  HEALTH CHECK
+# ============================================================================
+
+function Get-SCCMHealthScore {
+    Write-Log "===== HEALTH CHECK =====" "PHASE"
+
+    $passed = 0
+    $total  = 0
+
+    # CcmExec Service
+    $total++
+    try {
+        $svc = Get-Service -Name CcmExec -ErrorAction Stop
+        if ($svc.Status -eq "Running") { $passed++; Write-Log "CcmExec Service: Running" "SUCCESS" }
+        else { Write-Log "CcmExec Service: $($svc.Status)" "ERROR" }
+    } catch { Write-Log "CcmExec Service: Not found" "ERROR" }
+
+    # Client Version
+    $total++
+    try {
+        $client = Get-CimInstance -Namespace "root\ccm" -ClassName SMS_Client -ErrorAction Stop
+        $passed++; Write-Log "Client Version: $($client.ClientVersion)" "SUCCESS"
+    } catch { Write-Log "Client Version: Cannot query root\ccm" "ERROR" }
+
+    # WMI Health
+    $total++
+    try {
+        Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop | Out-Null
+        $passed++; Write-Log "WMI Health: OK" "SUCCESS"
+    } catch { Write-Log "WMI Health: FAILED" "ERROR" }
+
+    # SCCM WMI Namespaces
+    $total++
+    $nsOk = $true
+    foreach ($ns in @("root\ccm", "root\sms")) {
+        try { Get-CimInstance -Namespace $ns -ClassName "__NAMESPACE" -ErrorAction Stop | Out-Null }
+        catch { $nsOk = $false }
+    }
+    if ($nsOk) { $passed++; Write-Log "SCCM WMI Namespaces: Present" "SUCCESS" }
+    else { Write-Log "SCCM WMI Namespaces: Missing" "ERROR" }
+
+    # BITS Service
+    $total++
+    try {
+        $bits = Get-Service -Name BITS -ErrorAction Stop
+        if ($bits.Status -eq "Running" -or $bits.StartType -ne "Disabled") { $passed++; Write-Log "BITS: $($bits.Status)/$($bits.StartType)" "SUCCESS" }
+        else { Write-Log "BITS: Disabled" "ERROR" }
+    } catch { Write-Log "BITS: Not found" "ERROR" }
+
+    # Windows Update Service
+    $total++
+    try {
+        $wu = Get-Service -Name wuauserv -ErrorAction Stop
+        if ($wu.StartType -ne "Disabled") { $passed++; Write-Log "WU: $($wu.Status)/$($wu.StartType)" "SUCCESS" }
+        else { Write-Log "WU: Disabled" "ERROR" }
+    } catch { Write-Log "WU: Not found" "ERROR" }
+
+    # Cryptographic Services
+    $total++
+    try {
+        $crypto = Get-Service -Name CryptSvc -ErrorAction Stop
+        if ($crypto.Status -eq "Running") { $passed++; Write-Log "CryptSvc: Running" "SUCCESS" }
+        else { Write-Log "CryptSvc: $($crypto.Status)" "ERROR" }
+    } catch { Write-Log "CryptSvc: Not found" "ERROR" }
+
+    # SCCM Certificate
+    $total++
+    try {
+        $smsCerts = Get-ChildItem -Path "Cert:\LocalMachine\SMS" -ErrorAction Stop
+        $validCerts = $smsCerts | Where-Object { $_.NotAfter -gt (Get-Date) }
+        if ($validCerts) { $passed++; Write-Log "SMS Certs: $($validCerts.Count) valid" "SUCCESS" }
+        else { Write-Log "SMS Certs: No valid certs" "ERROR" }
+    } catch { Write-Log "SMS Certs: Store not found" "ERROR" }
+
+    # DNS Resolution
+    $total++
+    try {
+        Resolve-DnsName -Name $ManagementPoint -ErrorAction Stop | Out-Null
+        $passed++; Write-Log "DNS: Resolved $ManagementPoint" "SUCCESS"
+    } catch { Write-Log "DNS: Cannot resolve $ManagementPoint" "ERROR" }
+
+    # ccmsetup.log
+    $total++
+    $ccmsetupLog = "$env:SystemRoot\ccmsetup\Logs\ccmsetup.log"
+    if (Test-Path $ccmsetupLog) {
+        try {
+            $logContent = Get-Content $ccmsetupLog -Tail 50 -ErrorAction Stop
+            $errorLines = $logContent | Select-String -Pattern "error|fail|0x8" -AllMatches
+            if ($errorLines.Count -eq 0) { $passed++; Write-Log "ccmsetup.log: No recent errors" "SUCCESS" }
+            else { Write-Log "ccmsetup.log: Errors found" "WARN" }
+        } catch {
+            Write-Log "ccmsetup.log: Could not read" "WARN"
+        }
+    } else {
+        $passed++; Write-Log "ccmsetup.log: Not present" "INFO"
+    }
+
+    # Client Assignment
+    $total++
+    try {
+        $regSite = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\SMS\Mobile Client" -Name "AssignedSiteCode" -ErrorAction Stop).AssignedSiteCode
+        if ($regSite -eq $SiteCode) { $passed++; Write-Log "Site Assignment: $regSite (correct)" "SUCCESS" }
+        else { Write-Log "Site Assignment: $regSite (expected $SiteCode)" "WARN" }
+    } catch {
+        try {
+            $null = Get-CimInstance -Namespace "root\ccm" -ClassName SMS_Client -ErrorAction Stop
+            $passed++; Write-Log "Site Assignment: via WMI" "SUCCESS"
+        } catch { Write-Log "Site Assignment: Cannot determine" "ERROR" }
+    }
+
+    $score = [math]::Round(($passed / $total) * 100)
+    Write-Log "Health Score: $($score)% ($($passed)/$($total))" "INFO"
+
+    return @{ Score = $score; Passed = $passed; Total = $total }
+}
+
+# ============================================================================
+#  PHASE 3 -- STOP AND KILL EVERYTHING SCCM
+# ============================================================================
+
+function Stop-AllSCCM {
+    Write-Log "===== STOP AND KILL SCCM =====" "PHASE"
+
+    foreach ($svcName in @("CcmExec", "ccmsetup", "smstsmgr", "CmRcService")) {
+        try {
+            $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+            if ($svc -and $svc.Status -ne "Stopped") {
+                Stop-Service -Name $svcName -Force -ErrorAction Stop
+                Write-Log "Stopped service: $svcName" "SUCCESS"
+            }
+        } catch {
+            Write-Log "Could not stop $svcName -- $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    foreach ($procName in @("CcmExec", "CcmRestart", "ccmsetup", "CmRcService")) {
+        try {
+            $running = Get-Process -Name $procName -ErrorAction SilentlyContinue
+            if ($running) {
+                $running | Stop-Process -Force -ErrorAction Stop
+                Write-Log "Killed process: $procName" "SUCCESS"
+            }
+        } catch {
+            Write-Log "Could not kill $procName -- $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    try {
+        $svc = Get-Service -Name CcmExec -ErrorAction SilentlyContinue
+        if ($svc) {
+            Set-Service -Name CcmExec -StartupType Disabled -ErrorAction Stop
+            Write-Log "Disabled CcmExec service" "SUCCESS"
+        }
+    } catch {
+        Write-Log "Could not disable CcmExec -- $($_.Exception.Message)" "WARN"
+    }
+
+    Start-Sleep -Seconds 3
+}
+
+# ============================================================================
+#  PHASE 4 -- ATTEMPT CLEAN UNINSTALL
+# ============================================================================
+
+function Invoke-CleanUninstall {
+    Write-Log "===== CLEAN UNINSTALL =====" "PHASE"
+
+    $ccmsetupLocal = "$env:SystemRoot\ccmsetup\ccmsetup.exe"
+    if (-not (Test-Path $ccmsetupLocal)) {
+        Write-Log "Local ccmsetup.exe not found -- skipping uninstall" "WARN"
+        return $false
+    }
+
+    Write-Log "Running ccmsetup.exe /uninstall" "INFO"
+    try {
+        $proc = Start-Process -FilePath $ccmsetupLocal -ArgumentList "/uninstall" -PassThru -WindowStyle Hidden
+        $timeout = 300
+        $elapsed = 0
+        while (-not $proc.HasExited -and $elapsed -lt $timeout) {
+            Start-Sleep -Seconds 10
+            $elapsed += 10
+        }
+
+        if (-not $proc.HasExited) {
+            $proc | Stop-Process -Force
+            Write-Log "Uninstall timed out after $timeout seconds" "WARN"
+            return $false
+        }
+
+        $exitCode = $proc.ExitCode
+        if ($exitCode -eq 0) { Write-Log "Uninstall completed (exit code 0)" "SUCCESS" }
+        else { Write-Log "Uninstall exit code: $exitCode" "WARN" }
+        return ($exitCode -eq 0)
+    } catch {
+        Write-Log "Uninstall failed: $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
+
+# ============================================================================
+#  PHASE 5 -- DEEP CLEAN
+# ============================================================================
+
+function Invoke-DeepClean {
+    Write-Log "===== DEEP CLEAN =====" "PHASE"
+
+    # WMI Namespace Removal -- dynamically enumerate children
+    $namespacesToRemove = @()
+    try {
+        $children = Get-CimInstance -Namespace "root\ccm" -ClassName "__NAMESPACE" -ErrorAction SilentlyContinue
+        if ($children) {
+            foreach ($child in $children) {
+                $namespacesToRemove += "root\ccm\$($child.Name)"
+            }
+        }
+    } catch {
+        Write-Log "Could not enumerate root\ccm children (may already be gone)" "INFO"
+    }
+    $namespacesToRemove += "root\ccm"
+    $namespacesToRemove += "root\sms"
+
+    $namespacesToRemove | Sort-Object { $_.Split('\').Count } -Descending | ForEach-Object {
+        $ns = $_
+        try {
+            $parts = $ns -split '\\'
+            $leaf = $parts[-1]
+            $parent = ($parts[0..($parts.Count - 2)]) -join '\'
+            $existing = Get-CimInstance -Namespace $parent -ClassName "__NAMESPACE" -Filter "Name='$leaf'" -ErrorAction SilentlyContinue
+            if ($existing) {
+                Remove-CimInstance -InputObject $existing -ErrorAction Stop
+                Write-Log "Removed WMI namespace: $ns" "SUCCESS"
+            }
+        } catch {
+            Write-Log "Could not remove WMI namespace $ns -- $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    # File System Cleanup
+    foreach ($dir in @("$env:SystemRoot\CCM", "$env:SystemRoot\ccmsetup", "$env:SystemRoot\ccmcache")) {
+        if (Test-Path $dir) {
+            try {
+                Remove-Item -Path $dir -Recurse -Force -ErrorAction Stop
+                Write-Log "Removed directory: $dir" "SUCCESS"
+            } catch {
+                Start-Sleep -Seconds 2
+                try {
+                    Remove-Item -Path $dir -Recurse -Force -ErrorAction Stop
+                    Write-Log "Removed directory (retry): $dir" "SUCCESS"
+                } catch {
+                    Write-Log "Could not remove $dir -- $($_.Exception.Message)" "WARN"
+                }
+            }
+        }
+    }
+
+    # Individual files
+    if (Test-Path "$env:SystemRoot\SMSCFG.ini") {
+        Remove-Item -Path "$env:SystemRoot\SMSCFG.ini" -Force -ErrorAction SilentlyContinue
+        Write-Log "Removed SMSCFG.ini" "SUCCESS"
+    }
+
+    # Wildcard cleanup
+    Get-ChildItem -Path $env:SystemRoot -Filter "SMS*.mif" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue; Write-Log "Removed: $($_.Name)" "SUCCESS" }
+    Get-ChildItem -Path "$env:SystemRoot\Temp" -Filter "ccm*" -ErrorAction SilentlyContinue |
+        ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue; Write-Log "Removed: $($_.Name)" "SUCCESS" }
+
+    # Registry Cleanup
+    foreach ($key in @(
+        "HKLM:\SOFTWARE\Microsoft\CCM",
+        "HKLM:\SOFTWARE\Microsoft\CCMSetup",
+        "HKLM:\SOFTWARE\Microsoft\SMS",
+        "HKLM:\SOFTWARE\Microsoft\SystemCertificates\SMS\Certificates"
+    )) {
+        if (Test-Path $key) {
+            try {
+                Remove-Item -Path $key -Recurse -Force -ErrorAction Stop
+                Write-Log "Removed registry: $key" "SUCCESS"
+            } catch {
+                Write-Log "Could not remove registry $key -- $($_.Exception.Message)" "WARN"
+            }
+        }
+    }
+
+    # Uninstall entries
+    foreach ($uninstallPath in @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    )) {
+        try {
+            Get-ChildItem -Path $uninstallPath -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $dn = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).DisplayName
+                    $dn -match "Configuration Manager Client|System Center Configuration Manager"
+                } | ForEach-Object {
+                    Remove-Item -Path $_.PSPath -Recurse -Force -ErrorAction Stop
+                    Write-Log "Removed uninstall entry: $($_.PSPath)" "SUCCESS"
+                }
+        } catch {
+            Write-Log "Uninstall entry cleanup issue -- $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    # Certificate Cleanup
+    try {
+        if (Test-Path "Cert:\LocalMachine\SMS") {
+            Get-ChildItem -Path "Cert:\LocalMachine\SMS" -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    Remove-Item -Path $_.PSPath -Force -ErrorAction Stop
+                    Write-Log "Removed SMS cert: $($_.Thumbprint)" "SUCCESS"
+                }
+        }
+    } catch {
+        Write-Log "Certificate cleanup issue -- $($_.Exception.Message)" "WARN"
+    }
+
+    # Scheduled Task Cleanup (SCCM's own tasks, NOT our healing task)
+    try {
+        Get-ScheduledTask -ErrorAction SilentlyContinue |
+            Where-Object {
+                ($_.TaskName -match "Configuration Manager|SCCM|CCM" -or $_.TaskPath -match "Microsoft\\Configuration Manager") -and
+                $_.TaskName -ne $ScheduledTaskName
+            } |
+            ForEach-Object {
+                Unregister-ScheduledTask -TaskName $_.TaskName -TaskPath $_.TaskPath -Confirm:$false -ErrorAction Stop
+                Write-Log "Removed scheduled task: $($_.TaskPath)$($_.TaskName)" "SUCCESS"
+            }
+    } catch {
+        Write-Log "Scheduled task cleanup issue -- $($_.Exception.Message)" "WARN"
+    }
+
+    Write-Log "Deep clean complete" "SUCCESS"
+}
+
+# ============================================================================
+#  PHASE 6 -- PREREQUISITES REPAIR
+# ============================================================================
+
+function Repair-Prerequisites {
+    Write-Log "===== PREREQUISITES REPAIR =====" "PHASE"
+
+    # WMI
+    try {
+        $wmi = Get-Service -Name Winmgmt -ErrorAction Stop
+        if ($wmi.Status -ne "Running") {
+            Start-Service -Name Winmgmt -ErrorAction Stop
+            Write-Log "Started WMI service" "SUCCESS"
+        }
+    } catch {
+        Write-Log "Could not start WMI -- $($_.Exception.Message)" "ERROR"
+    }
+
+    try { $null = & winmgmt /resyncperf 2>&1; Write-Log "winmgmt /resyncperf done" "SUCCESS" }
+    catch { Write-Log "winmgmt /resyncperf failed" "WARN" }
+
+    # Check if WMI is fundamentally broken
+    $wmiCorrupt = $false
+    try {
+        Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop | Out-Null
+        Write-Log "WMI self-test (Win32_OperatingSystem): OK" "SUCCESS"
+    } catch {
+        $wmiCorrupt = $true
+        Write-Log "WMI self-test FAILED -- will perform bulk MOF recompilation" "WARN"
+    }
+
+    $wbemPath = "$env:SystemRoot\System32\wbem"
+
+    if ($wmiCorrupt) {
+        # Bulk recompile all MOF/MFL files (except uninstall MOFs) to rebuild WMI repository
+        Write-Log "Starting bulk MOF recompilation from $wbemPath ..." "INFO"
+        try {
+            $allMofs = Get-ChildItem -Path "$wbemPath\*" -Include "*.mof","*.mfl" -File -ErrorAction Stop |
+                Where-Object { $_.Name -notmatch "uninstall" }
+            $compiled = 0
+            foreach ($mof in $allMofs) {
+                try { $null = & mofcomp $mof.FullName 2>&1; $compiled++ } catch { }
+            }
+            Write-Log "Bulk MOF recompilation complete: $compiled of $($allMofs.Count) files" "SUCCESS"
+        } catch {
+            Write-Log "Bulk MOF recompilation error: $($_.Exception.Message)" "WARN"
+        }
+    } else {
+        # Selective MOF recompilation
+        $mofFiles = @(
+            "cimwin32.mof", "cimwin32.mfl", "win32_encryptablevolume.mof",
+            "rsop.mof", "rsop.mfl", "cmprov.mof", "cmprov.mfl",
+            "msi.mof", "tscfgwmi.mof", "policman.mof", "policman.mfl", "sr.mof"
+        )
+        foreach ($mof in $mofFiles) {
+            $mofPath = Join-Path $wbemPath $mof
+            if (Test-Path $mofPath) {
+                try {
+                    $null = & mofcomp $mofPath 2>&1
+                    Write-Log "Re-compiled MOF: $mof" "SUCCESS"
+                } catch {
+                    Write-Log "mofcomp failed for $mof" "WARN"
+                }
+            }
+        }
+    }
+
+    # Microsoft Policy Platform ExtendedStatus.mof
+    $extStatusMof = "$env:ProgramFiles\Microsoft Policy Platform\ExtendedStatus.mof"
+    if (Test-Path $extStatusMof) {
+        try {
+            $null = & mofcomp $extStatusMof 2>&1
+            Write-Log "Re-compiled MOF: ExtendedStatus.mof (Policy Platform)" "SUCCESS"
+        } catch {
+            Write-Log "mofcomp failed for ExtendedStatus.mof -- $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    # Service repair
+    try { Set-Service -Name BITS -StartupType Manual -ErrorAction Stop; Start-Service -Name BITS -ErrorAction SilentlyContinue; Write-Log "BITS repaired" "SUCCESS" }
+    catch { Write-Log "BITS repair issue -- $($_.Exception.Message)" "WARN" }
+
+    try { Set-Service -Name wuauserv -StartupType Manual -ErrorAction Stop; Start-Service -Name wuauserv -ErrorAction SilentlyContinue; Write-Log "WU repaired" "SUCCESS" }
+    catch { Write-Log "WU repair issue -- $($_.Exception.Message)" "WARN" }
+
+    try {
+        $crypto = Get-Service -Name CryptSvc -ErrorAction Stop
+        if ($crypto.Status -ne "Running") { Start-Service -Name CryptSvc -ErrorAction Stop }
+        Write-Log "CryptSvc running" "SUCCESS"
+    } catch { Write-Log "CryptSvc issue -- $($_.Exception.Message)" "WARN" }
+
+    # DLL re-registration
+    foreach ($dll in @("qmgr.dll", "qmgrprxy.dll")) {
+        try { $null = & regsvr32 /s "$env:SystemRoot\System32\$dll" 2>&1; Write-Log "Re-registered: $dll" "SUCCESS" }
+        catch { Write-Log "Could not register $dll" "WARN" }
+    }
+
+    $wuDlls = @("wuaueng.dll","wuapi.dll","wups.dll","wups2.dll","wuwebv.dll","wucltux.dll","wudriver.dll","atl.dll","msxml3.dll","msxml6.dll")
+    foreach ($dll in $wuDlls) {
+        $dllPath = "$env:SystemRoot\System32\$dll"
+        if (Test-Path $dllPath) {
+            try { $null = & regsvr32 /s $dllPath 2>&1; Write-Log "Re-registered: $dll" "SUCCESS" }
+            catch { Write-Log "Could not register $dll" "WARN" }
+        }
+    }
+
+    # Registry.pol corruption check
+    $polCorruptFound = $false
+    foreach ($polScope in @("Machine", "User")) {
+        $polPath = "$env:SystemRoot\System32\GroupPolicy\$polScope\registry.pol"
+        if (Test-Path $polPath) {
+            try {
+                $bytes = [System.IO.File]::ReadAllBytes($polPath)
+                $valid = $true
+                $expectedHeader = @(0x50, 0x52, 0x65, 0x67, 0x01, 0x00, 0x00, 0x00)
+                if ($bytes.Length -lt 8) {
+                    $valid = $false
+                } else {
+                    for ($i = 0; $i -lt 8; $i++) {
+                        if ($bytes[$i] -ne $expectedHeader[$i]) { $valid = $false; break }
+                    }
+                }
+
+                if ($valid) {
+                    Write-Log "registry.pol ($polScope): Valid (PReg header OK, $($bytes.Length) bytes)" "SUCCESS"
+                } else {
+                    Write-Log "registry.pol ($polScope): CORRUPT -- removing to allow GP rebuild" "WARN"
+                    Remove-Item -Path $polPath -Force -ErrorAction Stop
+                    Write-Log "registry.pol ($polScope) removed. Will be rebuilt on next gpupdate." "SUCCESS"
+                    $polCorruptFound = $true
+                }
+            } catch {
+                Write-Log "registry.pol ($polScope) check error: $($_.Exception.Message)" "WARN"
+            }
+        } else {
+            Write-Log "registry.pol ($polScope): Not present (will be created on next gpupdate)" "INFO"
+        }
+    }
+
+    if ($polCorruptFound) {
+        try {
+            $null = & gpupdate /force /target:computer 2>&1
+            Write-Log "Triggered gpupdate /force to rebuild registry.pol" "INFO"
+        } catch {
+            Write-Log "gpupdate failed: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    Write-Log "Prerequisites repair complete" "SUCCESS"
+}
+
+# ============================================================================
+#  PHASE 7 -- CLIENT REINSTALLATION
+# ============================================================================
+
+function Install-SCCMClient {
+    Write-Log "===== CLIENT REINSTALLATION =====" "PHASE"
+
+    $stagingDir = "$env:SystemRoot\Temp\ccmsetup_healing"
+    $stagingExe = Join-Path $stagingDir "ccmsetup.exe"
+    $sourceExe  = Join-Path $ClientSource "ccmsetup.exe"
+
+    if (-not (Test-Path $stagingDir)) {
+        New-Item -Path $stagingDir -ItemType Directory -Force | Out-Null
+    }
+
+    try {
+        Copy-Item -Path $sourceExe -Destination $stagingExe -Force -ErrorAction Stop
+        # Copy additional source files
+        Get-ChildItem -Path $ClientSource -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne "ccmsetup.exe" } |
+            ForEach-Object { Copy-Item -Path $_.FullName -Destination $stagingDir -Recurse -Force -ErrorAction SilentlyContinue }
+        Write-Log "Client files staged to $stagingDir" "SUCCESS"
+    } catch {
+        Write-Log "Failed to copy client source -- $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+
+    $dnsSuffix = ($ManagementPoint -split '\.', 2)[1]
+    if (-not $dnsSuffix) { $dnsSuffix = (Get-CimInstance Win32_ComputerSystem).Domain }
+
+    $installArgs = "/mp:$ManagementPoint /logon /usepkicert /allowmetered /nocrlcheck SMSSITECODE=$SiteCode SMSMP=$ManagementPoint DNSSUFFIX=$dnsSuffix RESETKEYINFORMATION=TRUE"
+
+    Write-Log "Running: ccmsetup.exe $installArgs" "INFO"
+
+    try {
+        $proc = Start-Process -FilePath $stagingExe -ArgumentList $installArgs -PassThru -WindowStyle Hidden
+        $timeout = 900  # 15 minutes
+        $elapsed = 0
+
+        while (-not $proc.HasExited -and $elapsed -lt $timeout) {
+            Start-Sleep -Seconds 15
+            $elapsed += 15
+            if ($elapsed % 60 -eq 0) {
+                Write-Log "Installation in progress ($($elapsed)s / $($timeout)s max)" "INFO"
+            }
+        }
+
+        if (-not $proc.HasExited) {
+            Write-Log "Installation timed out after $timeout seconds" "ERROR"
+            return $false
+        }
+
+        $exitCode = $proc.ExitCode
+
+        # Clean up staging directory
+        try {
+            Remove-Item -Path $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log "Cleaned up staging directory: $stagingDir" "INFO"
+        } catch { }
+
+        switch ($exitCode) {
+            0       { Write-Log "ccmsetup completed (exit code 0)" "SUCCESS"; return $true }
+            7       { Write-Log "ccmsetup exit code 7 -- reboot required" "WARN"; return $true }
+            default { Write-Log "ccmsetup exit code $exitCode" "ERROR"; return $false }
+        }
+    } catch {
+        Write-Log "Installation failed: $($_.Exception.Message)" "ERROR"
+        Remove-Item -Path $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+}
+
+# ============================================================================
+#  PHASE 8 -- POST-INSTALL VERIFICATION
+# ============================================================================
+
+function Test-PostInstall {
+    Write-Log "===== POST-INSTALL VERIFICATION =====" "PHASE"
+    Write-Log "Waiting 60 seconds for services to stabilize..." "INFO"
+    Start-Sleep -Seconds 60
+
+    $passed = 0
+    $total = 0
+    $clientVersion = "Unknown"
+
+    # CcmExec service
+    $total++
+    try {
+        $svc = Get-Service -Name CcmExec -ErrorAction Stop
+        if ($svc.Status -eq "Running") { $passed++; Write-Log "Post: CcmExec Running" "SUCCESS" }
+        else {
+            Start-Service -Name CcmExec -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 10
+            $svc.Refresh()
+            if ($svc.Status -eq "Running") { $passed++; Write-Log "Post: CcmExec started manually" "SUCCESS" }
+            else { Write-Log "Post: CcmExec $($svc.Status)" "ERROR" }
+        }
+    } catch { Write-Log "Post: CcmExec not found" "ERROR" }
+
+    # Client version
+    $total++
+    try {
+        $client = Get-CimInstance -Namespace "root\ccm" -ClassName SMS_Client -ErrorAction Stop
+        $clientVersion = $client.ClientVersion
+        $passed++; Write-Log "Post: Client version $clientVersion" "SUCCESS"
+    } catch { Write-Log "Post: Cannot query client version" "ERROR" }
+
+    # Site assignment
+    $total++
+    try {
+        $assignment = Invoke-CimMethod -Namespace "root\ccm" -ClassName SMS_Client -MethodName GetAssignedSite -ErrorAction Stop
+        $site = $assignment.sSiteCode
+        if ($site -eq $SiteCode) { $passed++; Write-Log "Post: Site $site (correct)" "SUCCESS" }
+        else { Write-Log "Post: Site $site (expected $SiteCode)" "WARN" }
+    } catch { Write-Log "Post: Cannot determine site" "ERROR" }
+
+    # Trigger machine policy
+    $total++
+    try {
+        Invoke-CimMethod -Namespace "root\ccm" -ClassName SMS_Client -MethodName TriggerSchedule -Arguments @{
+            sScheduleID = "{00000000-0000-0000-0000-000000000021}"
+        } -ErrorAction Stop
+        $passed++; Write-Log "Post: Machine policy triggered" "SUCCESS"
+    } catch { Write-Log "Post: Could not trigger policy -- $($_.Exception.Message)" "ERROR" }
+
+    # Trigger hardware inventory
+    try {
+        Invoke-CimMethod -Namespace "root\ccm" -ClassName SMS_Client -MethodName TriggerSchedule -Arguments @{
+            sScheduleID = "{00000000-0000-0000-0000-000000000001}"
+        } -ErrorAction SilentlyContinue
+        Write-Log "Post: Hardware inventory triggered" "INFO"
+    } catch { Write-Log "Post: Could not trigger HW inventory" "WARN" }
+
+    $score = [math]::Round(($passed / $total) * 100)
+    Write-Log "Post-install score: $($score)% ($($passed)/$($total))" "INFO"
+
+    return @{ Score = $score; Passed = $passed; Total = $total; ClientVersion = $clientVersion }
+}
+
+# ============================================================================
+#  AUTO-REMOVE -- UNREGISTER SELF
+# ============================================================================
+
+function Unregister-HealingTask {
+    Write-Log "Client healthy for $ConsecutiveSuccessThreshold consecutive checks. Auto-removing scheduled task." "SUCCESS"
+
+    try {
+        $task = Get-ScheduledTask -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -ErrorAction SilentlyContinue
+        if ($task) {
+            Unregister-ScheduledTask -TaskName $ScheduledTaskName -TaskPath $ScheduledTaskPath -Confirm:$false -ErrorAction Stop
+            Write-Log "Scheduled task '$ScheduledTaskName' unregistered successfully" "SUCCESS"
+        } else {
+            Write-Log "Scheduled task '$ScheduledTaskName' not found (already removed?)" "WARN"
+        }
+    } catch {
+        Write-Log "Could not unregister scheduled task '$ScheduledTaskName' -- $($_.Exception.Message)" "WARN"
+        Write-Log "Task may need manual removal from Task Scheduler" "WARN"
+    }
+}
+
+# ============================================================================
+#  MAIN EXECUTION
+# ============================================================================
+
+# Initialize log
+$logDir = Split-Path $LogPath -Parent
+if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
+
+# Start transcript as safety net
+$transcriptPath = "$env:SystemRoot\Temp\SCCMHealing-Task-Transcript.log"
+try { Start-Transcript -Path $transcriptPath -Append -ErrorAction SilentlyContinue } catch {}
+
+$startTime = Get-Date
+Write-Log "========================================" "PHASE"
+Write-Log "SCCM Client Healing (Task) started on $($env:COMPUTERNAME) at $startTime" "INFO"
+Write-Log "Config: SiteCode=$SiteCode, MP=$ManagementPoint, Source=$ClientSource" "INFO"
+Write-Log "Config: Threshold=$ConsecutiveSuccessThreshold, TaskName=$ScheduledTaskName" "INFO"
+
+# Log system info
+try {
+    $os = Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue
+    $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceAlias -notmatch "Loopback" } | Select-Object -First 1).IPAddress
+    Write-Log "OS: $($os.Caption) $($os.Version)" "INFO"
+    Write-Log "Domain: $($cs.Domain)" "INFO"
+    Write-Log "IP: $ip" "INFO"
+    Write-Log "Last Boot: $($os.LastBootUpTime)" "INFO"
+} catch {
+    Write-Log "Could not collect system info: $($_.Exception.Message)" "WARN"
+}
+
+# Read state file
+$state = Read-State
+$state.TotalRuns++
+
+# Check if we've already reached the consecutive success threshold
+if ($state.ConsecutiveSuccesses -ge $ConsecutiveSuccessThreshold) {
+    Write-Log "Already at $($state.ConsecutiveSuccesses) consecutive successes (threshold: $ConsecutiveSuccessThreshold)" "SUCCESS"
+    Unregister-HealingTask
+    $state.LastCheckTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Write-State -State $state
+    $elapsed = (Get-Date) - $startTime
+    Write-Log "Total elapsed time: $($elapsed.ToString('hh\:mm\:ss'))" "INFO"
+    Write-Log "========================================" "PHASE"
+    try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
+    exit 0
+}
+
+# Run health check
+$healthResult = Get-SCCMHealthScore
+
+if ($healthResult.Score -eq 100) {
+    # Client is healthy -- increment consecutive successes
+    $state.ConsecutiveSuccesses++
+    $state.LastCheckTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $state.LastHealthScore = $healthResult.Score
+
+    # Get client version for state
+    try {
+        $client = Get-CimInstance -Namespace "root\ccm" -ClassName SMS_Client -ErrorAction SilentlyContinue
+        if ($client) { $state.ClientVersion = $client.ClientVersion }
+    } catch {}
+
+    Write-Log "Client healthy. Consecutive successes: $($state.ConsecutiveSuccesses) of $ConsecutiveSuccessThreshold required" "SUCCESS"
+    Write-State -State $state
+
+    # Check if this success pushes us over the threshold
+    if ($state.ConsecutiveSuccesses -ge $ConsecutiveSuccessThreshold) {
+        Unregister-HealingTask
+    }
+
+    $elapsed = (Get-Date) - $startTime
+    Write-Log "Total elapsed time: $($elapsed.ToString('hh\:mm\:ss'))" "INFO"
+    Write-Log "========================================" "PHASE"
+    try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
+    exit 0
+}
+
+# Client is NOT healthy -- reset consecutive successes and heal
+Write-Log "Health score $($healthResult.Score)% -- healing required (resetting consecutive successes to 0)" "WARN"
+$state.ConsecutiveSuccesses = 0
+$state.LastCheckTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+$state.LastHealthScore = $healthResult.Score
+
+# Wait for network
+if (-not (Wait-ForNetwork)) {
+    Write-Log "Network unavailable. Will retry on next scheduled run." "ERROR"
+    Write-State -State $state
+    $elapsed = (Get-Date) - $startTime
+    Write-Log "Total elapsed time: $($elapsed.ToString('hh\:mm\:ss'))" "INFO"
+    Write-Log "========================================" "PHASE"
+    try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
+    exit 1
+}
+
+# Execute healing phases
+$state.TotalHeals++
+$state.LastHealTime = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+try { Stop-AllSCCM } catch { Write-Log "Stop phase error: $($_.Exception.Message)" "ERROR" }
+
+try { Invoke-CleanUninstall } catch { Write-Log "Uninstall phase error: $($_.Exception.Message)" "ERROR" }
+
+try { Invoke-DeepClean } catch { Write-Log "Deep clean phase error: $($_.Exception.Message)" "ERROR" }
+
+try { Repair-Prerequisites } catch { Write-Log "Prerequisites phase error: $($_.Exception.Message)" "ERROR" }
+
+$installSuccess = $false
+try { $installSuccess = Install-SCCMClient } catch { Write-Log "Install phase error: $($_.Exception.Message)" "ERROR" }
+
+if ($installSuccess) {
+    try {
+        $afterHealth = Test-PostInstall
+
+        if ($afterHealth.Score -ge 75) {
+            Write-Log "HEALING SUCCEEDED -- Score: $($afterHealth.Score)%" "SUCCESS"
+            $state.ConsecutiveSuccesses = 1
+            $state.LastHealthScore = $afterHealth.Score
+            $state.ClientVersion = $afterHealth.ClientVersion
+        } else {
+            Write-Log "HEALING PARTIAL -- Score: $($afterHealth.Score)%. Will retry on next scheduled run." "WARN"
+            $state.ConsecutiveSuccesses = 0
+            $state.LastHealthScore = $afterHealth.Score
+        }
+    } catch {
+        Write-Log "Post-install verification error: $($_.Exception.Message)" "ERROR"
+        $state.ConsecutiveSuccesses = 0
+    }
+} else {
+    Write-Log "INSTALLATION FAILED. Will retry on next scheduled run." "ERROR"
+    $state.ConsecutiveSuccesses = 0
+}
+
+Write-State -State $state
+
+$elapsed = (Get-Date) - $startTime
+Write-Log "Total elapsed time: $($elapsed.ToString('hh\:mm\:ss'))" "INFO"
+Write-Log "========================================" "PHASE"
+
+try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
