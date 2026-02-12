@@ -11,6 +11,9 @@
     in a row.
 
     Key differences from the GPO startup edition:
+      - Self-staging: when launched from a UNC path, copies itself to
+        C:\Support and re-launches locally (avoids Defender temp blocks
+        and network dependency during execution)
       - Runs as a scheduled task (startup + daily) instead of GPO startup script
       - JSON state file tracks consecutive successes across runs
       - Auto-removes the scheduled task after N consecutive healthy checks
@@ -51,6 +54,8 @@
        - Action: Start a program
        - Program: powershell.exe
        - Arguments: -ExecutionPolicy Bypass -NoProfile -NonInteractive -File "\\path\to\ClientHealing-Task.ps1"
+       NOTE: The script self-stages to C:\Support and re-launches locally.
+       The scheduled task can safely point to the UNC path.
 
     9. Settings tab:
        - Allow task to be run on demand: checked
@@ -60,6 +65,13 @@
     10. REMOVAL: Once all clients are healed, the task auto-removes itself.
         Remove the GPO link to stop deploying to new machines.
         If a machine was missed, GPO will re-create the task on next gpupdate.
+
+    LOCAL FILES (created automatically in C:\Support):
+    ==================================================
+    - ClientHealing-Task.ps1    -- local copy of the script
+    - SCCMHealing-Task.log      -- execution log
+    - SCCMHealing-Task.state    -- JSON state file (consecutive successes)
+    - SCCMHealing-Task-Transcript.log -- PowerShell transcript (safety net)
 
     TESTING:
     ========
@@ -75,14 +87,49 @@
 $SiteCode                    = "YOURSITECODE"
 $ManagementPoint             = "YOURMP.domain.com"
 $ClientSource                = "\\SERVER\Share\Client"
-$LogPath                     = "$env:SystemRoot\Temp\SCCMHealing-Task.log"
-$StateFile                   = "$env:SystemRoot\Temp\SCCMHealing-Task.state"
+$LocalStagingDir             = "C:\Support"             # Local execution directory (avoids Defender temp blocks)
+$LogPath                     = "$LocalStagingDir\SCCMHealing-Task.log"
+$StateFile                   = "$LocalStagingDir\SCCMHealing-Task.state"
 $MaxRetries                  = 3          # Network path retry attempts
 $RetryDelaySec               = 30         # Seconds between retries
 $ConsecutiveSuccessThreshold = 3          # Auto-remove after this many consecutive healthy checks
 $ScheduledTaskName           = "SCCM Client Healing"   # Must match the name in GPO Preferences
 $ScheduledTaskPath           = "\"                      # Root of Task Scheduler
 # =============================================================================
+
+# ============================================================================
+#  SELF-STAGING BOOTSTRAP
+#  If running from a UNC path, copy self to C:\Support and re-launch locally.
+#  This avoids network dependency during execution and Defender temp blocks.
+# ============================================================================
+
+# Ensure C:\Support exists
+if (-not (Test-Path $LocalStagingDir)) {
+    New-Item -Path $LocalStagingDir -ItemType Directory -Force | Out-Null
+}
+
+$scriptPath = $MyInvocation.MyCommand.Path
+$localScript = Join-Path $LocalStagingDir "ClientHealing-Task.ps1"
+
+if ($scriptPath -and $scriptPath -match '^\\\\') {
+    # Running from a UNC path -- stage locally and re-launch
+    try {
+        Copy-Item -Path $scriptPath -Destination $localScript -Force -ErrorAction Stop
+    } catch {
+        # If copy fails, still try to run from the network path
+        exit 1
+    }
+
+    # Re-launch from the local copy and exit this instance
+    $psArgs = @(
+        "-ExecutionPolicy", "Bypass",
+        "-NoProfile",
+        "-NonInteractive",
+        "-File", $localScript
+    )
+    Start-Process -FilePath "powershell.exe" -ArgumentList $psArgs -WindowStyle Hidden -Wait
+    exit $LASTEXITCODE
+}
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -666,7 +713,7 @@ function Repair-Prerequisites {
 function Install-SCCMClient {
     Write-Log "===== CLIENT REINSTALLATION =====" "PHASE"
 
-    $stagingDir = "$env:SystemRoot\Temp\ccmsetup_healing"
+    $stagingDir = "$LocalStagingDir\ccmsetup_healing"
     $stagingExe = Join-Path $stagingDir "ccmsetup.exe"
     $sourceExe  = Join-Path $ClientSource "ccmsetup.exe"
 
@@ -827,7 +874,7 @@ $logDir = Split-Path $LogPath -Parent
 if (-not (Test-Path $logDir)) { New-Item -Path $logDir -ItemType Directory -Force | Out-Null }
 
 # Start transcript as safety net
-$transcriptPath = "$env:SystemRoot\Temp\SCCMHealing-Task-Transcript.log"
+$transcriptPath = "$LocalStagingDir\SCCMHealing-Task-Transcript.log"
 try { Start-Transcript -Path $transcriptPath -Append -ErrorAction SilentlyContinue } catch {}
 
 $startTime = Get-Date
