@@ -1,0 +1,11 @@
+# Logs
+*.log
+
+# State files
+*.state
+*.marker
+
+# Editor backups
+*~
+*.bak
+*.swp

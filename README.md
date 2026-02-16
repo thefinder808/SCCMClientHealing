@@ -233,6 +233,17 @@ Default log locations:
 | GPO | `%SystemRoot%\Temp\SCCMHealing-GPO.log` |
 | Task | `C:\Support\SCCMHealing-Task.log` |
 
+## Disclaimer
+
+This toolkit performs **destructive operations** by design — it removes WMI namespaces, registry keys, certificates, files, and scheduled tasks related to the SCCM client. It is intended for machines with broken clients that resist normal repair.
+
+- **Always test in a lab or on a small group of machines before broad deployment**
+- The `-DiagnosticsOnly` flag (interactive edition) runs assessment without making any changes
+- Review the configuration variables at the top of each script before use
+- The scripts are designed to run as SYSTEM or local administrator
+
+The authors are not responsible for any unintended effects. Use at your own risk.
+
 ## License
 
-This project is provided as-is for use in enterprise SCCM environments.
+This project is licensed under the [MIT License](LICENSE).
