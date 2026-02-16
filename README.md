@@ -36,7 +36,7 @@ Best for testing and one-off repairs. Provides color-coded console output with r
 | Parameter | Required | Description |
 |-----------|----------|-------------|
 | `-SiteCode` | Yes | Your SCCM site code |
-| `-ManagementPoint` | Yes | FQDN of your management point |
+| `-ManagementPoint` | Yes | FQDN of your management point (may include `HTTPS://` prefix) |
 | `-ClientSource` | Yes* | UNC path to directory containing `ccmsetup.exe` |
 | `-LogPath` | No | Custom log file path |
 | `-ForceReinstall` | No | Skip health check, proceed directly to healing |
@@ -147,14 +147,14 @@ All three editions execute the same 9-phase healing engine:
 Validates system info, verifies the client source share is accessible, and tests management point connectivity on ports 80/443.
 
 ### Phase 2: Diagnostic Assessment
-Evaluates 12 health checks across four categories and produces a percentage-based health score:
+Evaluates 13 health checks across four categories and produces a percentage-based health score:
 
 | Category | Checks |
 |----------|--------|
-| **Service & Process** | CcmExec service, client version (WMI), WMI health, SCCM WMI namespaces |
+| **Service & Process** | CcmExec service, client version (WMI), WMI health, SCCM WMI namespaces (`root\ccm`) |
 | **Core Dependencies** | BITS service, Windows Update service, Cryptographic Services |
-| **Certificates & Network** | SMS certificate store validity, MP DNS resolution |
-| **Configuration** | ccmsetup.log error analysis, site code assignment |
+| **Certificates & Network** | SMS certificate store validity, MP DNS resolution, MP communication freshness (7-day threshold) |
+| **Configuration** | ccmsetup.log last exit code, site code assignment |
 
 Health scores: **90%+** healthy | **50–89%** degraded | **<50%** critical
 

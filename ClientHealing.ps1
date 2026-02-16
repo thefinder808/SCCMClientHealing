@@ -127,16 +127,21 @@ function Invoke-PreFlightChecks {
     Write-Phase 1 "Pre-Flight Checks"
 
     # System info
-    $os = Get-CimInstance Win32_OperatingSystem
-    $cs = Get-CimInstance Win32_ComputerSystem
-    $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notmatch "Loopback" } | Select-Object -First 1).IPAddress
-    $lastBoot = $os.LastBootUpTime
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $cs = Get-CimInstance Win32_ComputerSystem -ErrorAction Stop
+        $ip = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceAlias -notmatch "Loopback" } | Select-Object -First 1).IPAddress
+        $lastBoot = $os.LastBootUpTime
 
-    Write-Log "Hostname:    $($env:COMPUTERNAME)" "INFO"
-    Write-Log "OS:          $($os.Caption) $($os.Version)" "INFO"
-    Write-Log "Domain:      $($cs.Domain)" "INFO"
-    Write-Log "IP Address:  $ip" "INFO"
-    Write-Log "Last Boot:   $lastBoot" "INFO"
+        Write-Log "Hostname:    $($env:COMPUTERNAME)" "INFO"
+        Write-Log "OS:          $($os.Caption) $($os.Version)" "INFO"
+        Write-Log "Domain:      $($cs.Domain)" "INFO"
+        Write-Log "IP Address:  $ip" "INFO"
+        Write-Log "Last Boot:   $lastBoot" "INFO"
+    } catch {
+        Write-Log "Hostname:    $($env:COMPUTERNAME)" "INFO"
+        Write-Log "Could not collect full system info: $($_.Exception.Message)" "WARN"
+    }
 
     # Validate client source
     if (Test-Path (Join-Path $ClientSource "ccmsetup.exe")) {
@@ -149,11 +154,13 @@ function Invoke-PreFlightChecks {
     }
 
     # Test MP connectivity
+    # Strip protocol prefix for network tests (ping, TCP)
+    $mpHostname = $ManagementPoint -replace '^https?://', ''
     $mpReachable = $false
     try {
-        $ping = Test-Connection -ComputerName $ManagementPoint -Count 2 -Quiet -ErrorAction SilentlyContinue
+        $ping = Test-Connection -ComputerName $mpHostname -Count 2 -Quiet -ErrorAction SilentlyContinue
         if ($ping) {
-            Write-Log "Management Point responds to ping: $ManagementPoint" "SUCCESS"
+            Write-Log "Management Point responds to ping: $mpHostname" "SUCCESS"
         } else {
             Write-Log "Management Point does not respond to ping (may be blocked by firewall)" "WARN"
         }
@@ -165,16 +172,16 @@ function Invoke-PreFlightChecks {
     foreach ($port in @(443, 80)) {
         try {
             $tcp = New-Object System.Net.Sockets.TcpClient
-            $tcp.ConnectAsync($ManagementPoint, $port).Wait(3000) | Out-Null
+            $tcp.ConnectAsync($mpHostname, $port).Wait(3000) | Out-Null
             if ($tcp.Connected) {
-                Write-Log "TCP connection to ${ManagementPoint}:$port succeeded" "SUCCESS"
+                Write-Log "TCP connection to ${mpHostname}:$port succeeded" "SUCCESS"
                 $mpReachable = $true
                 $tcp.Close()
                 break
             }
             $tcp.Close()
         } catch {
-            Write-Log "TCP connection to ${ManagementPoint}:$port failed" "WARN"
+            Write-Log "TCP connection to ${mpHostname}:$port failed" "WARN"
         }
     }
 
@@ -240,21 +247,28 @@ function Get-SCCMHealthScore {
 
     # --- SCCM WMI Namespaces ---
     $total++
-    $nsOk = $true
-    foreach ($ns in @("root\ccm", "root\sms")) {
-        try {
-            Get-CimInstance -Namespace $ns -ClassName "__NAMESPACE" -ErrorAction Stop | Out-Null
-        } catch {
-            $nsOk = $false
-        }
+    # root\ccm is required for a healthy client; root\sms is a site server
+    # namespace that may or may not exist on clients -- don't fail on it.
+    $ccmOk = $true
+    try {
+        Get-CimInstance -Namespace "root\ccm" -ClassName "__NAMESPACE" -ErrorAction Stop | Out-Null
+    } catch {
+        $ccmOk = $false
     }
-    if ($nsOk) {
-        $checks["SCCM WMI Namespaces"] = "PASS"
+    $smsOk = $true
+    try {
+        Get-CimInstance -Namespace "root\sms" -ClassName "__NAMESPACE" -ErrorAction Stop | Out-Null
+    } catch {
+        $smsOk = $false
+    }
+    if ($ccmOk) {
+        $smsNote = if ($smsOk) { "root\sms present" } else { "root\sms absent (OK for clients)" }
+        $checks["SCCM WMI Namespaces"] = "PASS - root\ccm present, $smsNote"
         $passed++
-        Write-Log "SCCM WMI Namespaces (root\ccm, root\sms): Present" "SUCCESS"
+        Write-Log "SCCM WMI Namespaces: root\ccm present, $smsNote" "SUCCESS"
     } else {
-        $checks["SCCM WMI Namespaces"] = "FAIL - One or more missing"
-        Write-Log "SCCM WMI Namespaces: Missing" "ERROR"
+        $checks["SCCM WMI Namespaces"] = "FAIL - root\ccm missing"
+        Write-Log "SCCM WMI Namespaces: root\ccm missing" "ERROR"
     }
 
     # --- BITS Service ---
@@ -328,31 +342,40 @@ function Get-SCCMHealthScore {
 
     # --- DNS Resolution ---
     $total++
+    # Strip protocol prefix (e.g. "HTTPS://") so Resolve-DnsName gets a bare hostname
+    $mpHostname = $ManagementPoint -replace '^https?://', ''
     try {
-        $dns = Resolve-DnsName -Name $ManagementPoint -ErrorAction Stop
+        $dns = Resolve-DnsName -Name $mpHostname -ErrorAction Stop
         $checks["DNS Resolution"] = "PASS - $($dns[0].IPAddress)"
         $passed++
-        Write-Log "DNS Resolution: $ManagementPoint -> $($dns[0].IPAddress)" "SUCCESS"
+        Write-Log "DNS Resolution: $mpHostname -> $($dns[0].IPAddress)" "SUCCESS"
     } catch {
-        $checks["DNS Resolution"] = "FAIL - Cannot resolve $ManagementPoint"
-        Write-Log "DNS Resolution: FAILED for $ManagementPoint" "ERROR"
+        $checks["DNS Resolution"] = "FAIL - Cannot resolve $mpHostname"
+        Write-Log "DNS Resolution: FAILED for $mpHostname" "ERROR"
     }
 
-    # --- ccmsetup.log Analysis ---
+    # --- ccmsetup.log Analysis (check last exit code only) ---
     $total++
     $ccmsetupLog = "$env:SystemRoot\ccmsetup\Logs\ccmsetup.log"
     if (Test-Path $ccmsetupLog) {
         try {
-            $logContent = Get-Content $ccmsetupLog -Tail 50 -ErrorAction Stop
-            $errorLines = $logContent | Select-String -Pattern "error|fail|0x8" -AllMatches
-            if ($errorLines.Count -eq 0) {
-                $checks["ccmsetup.log"] = "PASS - No recent errors"
-                $passed++
-                Write-Log "ccmsetup.log: No recent errors" "SUCCESS"
+            $logContent = Get-Content $ccmsetupLog -Tail 100 -ErrorAction Stop
+            $exitLine = $logContent | Select-String -Pattern "CcmSetup is exiting with return code (\d+)" | Select-Object -Last 1
+            if ($exitLine) {
+                $exitCode = [int]$exitLine.Matches[0].Groups[1].Value
+                if ($exitCode -eq 0 -or $exitCode -eq 7) {
+                    $checks["ccmsetup.log"] = "PASS - Last exit code $exitCode"
+                    $passed++
+                    Write-Log "ccmsetup.log: Last exit code $exitCode (success)" "SUCCESS"
+                } else {
+                    $checks["ccmsetup.log"] = "FAIL - Last exit code $exitCode"
+                    Write-Log "ccmsetup.log: Last exit code $exitCode" "ERROR"
+                }
             } else {
-                $lastErr = ($errorLines | Select-Object -Last 1).Line.Trim()
-                $checks["ccmsetup.log"] = "WARN - $lastErr"
-                Write-Log "ccmsetup.log: Errors found -- $lastErr" "WARN"
+                # No exit line found -- install may still be in progress or log is old
+                $checks["ccmsetup.log"] = "PASS - No exit code found (install may be in progress)"
+                $passed++
+                Write-Log "ccmsetup.log: No exit code line found" "INFO"
             }
         } catch {
             $checks["ccmsetup.log"] = "WARN - Could not read log"
@@ -362,6 +385,44 @@ function Get-SCCMHealthScore {
         $checks["ccmsetup.log"] = "INFO - Log not present"
         Write-Log "ccmsetup.log: Not present" "INFO"
         $passed++ # Not necessarily a failure
+    }
+
+    # --- MP Communication (CcmMessaging.log freshness) ---
+    $total++
+    $ccmMsgLog = "$env:SystemRoot\CCM\Logs\CcmMessaging.log"
+    $mpCommMaxDays = 7
+    if (Test-Path $ccmMsgLog) {
+        try {
+            $lastLines = Get-Content $ccmMsgLog -Tail 20 -ErrorAction Stop
+            $lastTimestamp = $null
+            # CCM log format: <time="HH:MM:SS.mmm+offset" date="MM-DD-YYYY" ...>
+            for ($i = $lastLines.Count - 1; $i -ge 0; $i--) {
+                if ($lastLines[$i] -match 'time="(\d{2}:\d{2}:\d{2})\.\d+[^"]*"\s+date="(\d{2}-\d{2}-\d{4})"') {
+                    $lastTimestamp = [datetime]::ParseExact("$($Matches[2]) $($Matches[1])", 'MM-dd-yyyy HH:mm:ss', $null)
+                    break
+                }
+            }
+            if ($lastTimestamp) {
+                $daysSince = ((Get-Date) - $lastTimestamp).Days
+                if ($daysSince -le $mpCommMaxDays) {
+                    $checks["MP Communication"] = "PASS - Last activity $daysSince day(s) ago ($($lastTimestamp.ToString('yyyy-MM-dd HH:mm')))"
+                    $passed++
+                    Write-Log "MP Communication: Last activity $daysSince day(s) ago ($lastTimestamp)" "SUCCESS"
+                } else {
+                    $checks["MP Communication"] = "FAIL - No activity for $daysSince day(s) ($($lastTimestamp.ToString('yyyy-MM-dd HH:mm')))"
+                    Write-Log "MP Communication: No activity for $daysSince days (threshold: $mpCommMaxDays)" "ERROR"
+                }
+            } else {
+                $checks["MP Communication"] = "WARN - Could not parse timestamps from log"
+                Write-Log "MP Communication: Could not parse timestamps" "WARN"
+            }
+        } catch {
+            $checks["MP Communication"] = "WARN - Could not read CcmMessaging.log"
+            Write-Log "MP Communication: Could not read log -- $($_.Exception.Message)" "WARN"
+        }
+    } else {
+        $checks["MP Communication"] = "FAIL - CcmMessaging.log not found"
+        Write-Log "MP Communication: CcmMessaging.log not found (client may not be installed)" "ERROR"
     }
 
     # --- Client Site Assignment ---
@@ -978,8 +1039,9 @@ function Install-SCCMClient {
         return $false
     }
 
-    # Determine DNS suffix from MP FQDN
-    $dnsSuffix = ($ManagementPoint -split '\.', 2)[1]
+    # Determine DNS suffix from MP FQDN (strip protocol prefix first)
+    $mpHostnameForSuffix = $ManagementPoint -replace '^https?://', ''
+    $dnsSuffix = ($mpHostnameForSuffix -split '\.', 2)[1]
     if (-not $dnsSuffix) { $dnsSuffix = (Get-CimInstance Win32_ComputerSystem).Domain }
 
     # Build install arguments
@@ -990,7 +1052,7 @@ function Install-SCCMClient {
         "/allowmetered",
         "/nocrlcheck",
         "SMSSITECODE=$SiteCode",
-        "SMSMP=$ManagementPoint",
+        "SMSMP=$mpHostnameForSuffix",
         "DNSSUFFIX=$dnsSuffix",
         "RESETKEYINFORMATION=TRUE"
     )
