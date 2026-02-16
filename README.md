@@ -89,6 +89,56 @@ A self-healing agent that monitors client health over time and gracefully remove
 - Auto-unregisters the scheduled task after 3 consecutive healthy checks (configurable)
 - Cleans up its own staged files on retirement
 
+## Triage Script
+
+Before deploying the healing scripts, use `Get-NoClientTriage.ps1` to identify which of your NO CLIENT machines actually need remediation versus which are retired or orphaned records.
+
+The script queries SCCM for all devices with no client, then cross-references Active Directory to classify each machine into one of five buckets:
+
+| Bucket | Meaning | Recommended Action |
+|--------|---------|-------------------|
+| **Broken Client** | Active in AD (logon within threshold), no SCCM client | Deploy healing script |
+| **Likely Retired** | Stale AD logon (beyond threshold) | Let age out or delete manually |
+| **Disabled in AD** | Computer account disabled | Clean up SCCM record |
+| **Not in AD** | Exists in SCCM but no AD object | Orphaned record, safe to delete |
+| **Unknown** | No logon data available | Investigate manually |
+
+**Requirements:** Must be run from a machine with the SCCM admin console installed. Requires the `ActiveDirectory` and `ConfigurationManager` PowerShell modules.
+
+```powershell
+# Basic report with console summary
+.\Get-NoClientTriage.ps1 -SiteCode "ABC" -SiteServer "sccm.domain.com"
+
+# Full report with CSV export and connectivity test
+.\Get-NoClientTriage.ps1 -SiteCode "ABC" -SiteServer "sccm.domain.com" -ExportCsv "C:\Temp\NoClientReport.csv" -PingTest
+
+# Custom stale threshold (default is 25 days)
+.\Get-NoClientTriage.ps1 -SiteCode "ABC" -SiteServer "sccm.domain.com" -StaleThresholdDays 30
+```
+
+**Parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| `-SiteCode` | Yes | Your SCCM site code |
+| `-SiteServer` | Yes | FQDN of the SCCM site server / SMS Provider |
+| `-StaleThresholdDays` | No | Days since last AD logon before a machine is considered likely retired (default: 25) |
+| `-ExportCsv` | No | File path to export the full results as CSV |
+| `-PingTest` | No | Perform a connectivity test on machines classified as Broken Client |
+
+**SCCM Collection Query Alternative:**
+
+If you prefer a live collection over a one-time script, create a device collection with this query membership rule (requires AD System Discovery to be enabled):
+
+```sql
+select SMS_R_SYSTEM.ResourceID, SMS_R_SYSTEM.ResourceType, SMS_R_SYSTEM.Name,
+    SMS_R_SYSTEM.SMSUniqueIdentifier, SMS_R_SYSTEM.ResourceDomainORWorkgroup,
+    SMS_R_SYSTEM.Client
+from SMS_R_System
+where (SMS_R_System.Client = 0 or SMS_R_System.Client is null)
+    and DateDiff(dd, SMS_R_System.LastLogonTimestamp, GetDate()) <= 25
+```
+
 ## How It Works
 
 All three editions execute the same 9-phase healing engine:
