@@ -95,6 +95,7 @@ $RetryDelaySec               = 30         # Seconds between retries
 $ConsecutiveSuccessThreshold = 3          # Auto-remove after this many consecutive healthy checks
 $ScheduledTaskName           = "SCCM Client Healing"   # Must match the name in GPO Preferences
 $ScheduledTaskPath           = "\"                      # Root of Task Scheduler
+$NetworkLogShare             = "\\SERVER\Share\SCCMLogs"   # UNC path -- logs deposited to $NetworkLogShare\<ComputerName>\
 # =============================================================================
 
 # ============================================================================
@@ -147,6 +148,24 @@ function Write-Log {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $entry = "[$ts] [$Level] $Message"
     Add-Content -Path $LogPath -Value $entry -ErrorAction SilentlyContinue
+}
+
+function Copy-LogToNetworkShare {
+    if (-not $NetworkLogShare -or $NetworkLogShare -match '\\\\SERVER\\Share') { return }
+    try {
+        $destDir = Join-Path $NetworkLogShare $env:COMPUTERNAME
+        if (-not (Test-Path $destDir)) {
+            New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+        }
+        foreach ($file in @($LogPath, $transcriptPath, $StateFile)) {
+            if ($file -and (Test-Path $file)) {
+                Copy-Item -Path $file -Destination $destDir -Force -ErrorAction Stop
+            }
+        }
+        Write-Log "Logs copied to $destDir" "INFO"
+    } catch {
+        Write-Log "Failed to copy logs to network share: $($_.Exception.Message)" "WARN"
+    }
 }
 
 # ============================================================================
@@ -933,6 +952,7 @@ if ($state.ConsecutiveSuccesses -ge $ConsecutiveSuccessThreshold) {
     $elapsed = (Get-Date) - $startTime
     Write-Log "Total elapsed time: $($elapsed.ToString('hh\:mm\:ss'))" "INFO"
     Write-Log "========================================" "PHASE"
+    Copy-LogToNetworkShare
     try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
     exit 0
 }
@@ -963,6 +983,7 @@ if ($healthResult.Score -eq 100) {
     $elapsed = (Get-Date) - $startTime
     Write-Log "Total elapsed time: $($elapsed.ToString('hh\:mm\:ss'))" "INFO"
     Write-Log "========================================" "PHASE"
+    Copy-LogToNetworkShare
     try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
     exit 0
 }
@@ -980,6 +1001,7 @@ if (-not (Wait-ForNetwork)) {
     $elapsed = (Get-Date) - $startTime
     Write-Log "Total elapsed time: $($elapsed.ToString('hh\:mm\:ss'))" "INFO"
     Write-Log "========================================" "PHASE"
+    Copy-LogToNetworkShare
     try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
     exit 1
 }
@@ -1028,4 +1050,5 @@ $elapsed = (Get-Date) - $startTime
 Write-Log "Total elapsed time: $($elapsed.ToString('hh\:mm\:ss'))" "INFO"
 Write-Log "========================================" "PHASE"
 
+Copy-LogToNetworkShare
 try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}

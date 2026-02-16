@@ -57,6 +57,7 @@ $MarkerFile      = "$env:SystemRoot\Temp\SCCMHealing-Success.marker"
 $MaxRetries      = 3          # Network path retry attempts
 $RetryDelaySec   = 30         # Seconds between retries
 $MarkerMaxAgeDays = 7         # Re-run if marker is older than this
+$NetworkLogShare  = "\\SERVER\Share\SCCMLogs"   # UNC path -- logs deposited to $NetworkLogShare\<ComputerName>\
 # =============================================================================
 
 Set-StrictMode -Version Latest
@@ -75,6 +76,24 @@ function Write-Log {
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $entry = "[$ts] [$Level] $Message"
     Add-Content -Path $LogPath -Value $entry -ErrorAction SilentlyContinue
+}
+
+function Copy-LogToNetworkShare {
+    if (-not $NetworkLogShare -or $NetworkLogShare -match '\\\\SERVER\\Share') { return }
+    try {
+        $destDir = Join-Path $NetworkLogShare $env:COMPUTERNAME
+        if (-not (Test-Path $destDir)) {
+            New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+        }
+        foreach ($file in @($LogPath, $transcriptPath)) {
+            if ($file -and (Test-Path $file)) {
+                Copy-Item -Path $file -Destination $destDir -Force -ErrorAction Stop
+            }
+        }
+        Write-Log "Logs copied to $destDir" "INFO"
+    } catch {
+        Write-Log "Failed to copy logs to network share: $($_.Exception.Message)" "WARN"
+    }
 }
 
 # ============================================================================
@@ -799,6 +818,7 @@ try {
 
 # Check marker file -- exit early if already healed recently
 if (Test-MarkerFile) {
+    Copy-LogToNetworkShare
     try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
     exit 0
 }
@@ -813,6 +833,7 @@ if ($beforeHealth.Score -eq 100) {
         $ver = if ($client) { $client.ClientVersion } else { "Healthy" }
     } catch { $ver = "Healthy" }
     Write-MarkerFile -ClientVersion $ver
+    Copy-LogToNetworkShare
     try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
     exit 0
 }
@@ -822,6 +843,7 @@ Write-Log "Health score $($beforeHealth.Score) percent -- healing required" "WAR
 # Wait for network (GPO may run before network is ready)
 if (-not (Wait-ForNetwork)) {
     Write-Log "Network unavailable. Will retry next boot." "ERROR"
+    Copy-LogToNetworkShare
     try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}
     exit 1
 }
@@ -859,4 +881,5 @@ $elapsed = (Get-Date) - $startTime
 Write-Log "Total elapsed time: $($elapsed.ToString('hh\:mm\:ss'))" "INFO"
 Write-Log "========================================" "PHASE"
 
+Copy-LogToNetworkShare
 try { Stop-Transcript -ErrorAction SilentlyContinue } catch {}

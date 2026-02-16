@@ -57,6 +57,10 @@ param(
     [switch]$DiagnosticsOnly
 )
 
+# ===== NETWORK LOG SHARE - EDIT THIS VALUE ===================================
+$NetworkLogShare = "\\SERVER\Share\SCCMLogs"   # UNC path -- logs deposited to $NetworkLogShare\<ComputerName>\
+# ==============================================================================
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
@@ -91,6 +95,22 @@ function Write-Phase {
     Write-Host "  PHASE $Number - $Title" -ForegroundColor White
     Write-Host "  $line" -ForegroundColor White
     Write-Log "===== PHASE $Number - $Title =====" "PHASE"
+}
+
+function Copy-LogToNetworkShare {
+    if (-not $NetworkLogShare -or $NetworkLogShare -match '\\\\SERVER\\Share') { return }
+    try {
+        $destDir = Join-Path $NetworkLogShare $env:COMPUTERNAME
+        if (-not (Test-Path $destDir)) {
+            New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+        }
+        if (Test-Path $LogPath) {
+            Copy-Item -Path $LogPath -Destination $destDir -Force -ErrorAction Stop
+            Write-Host "  [INFO] Log copied to $destDir" -ForegroundColor Cyan
+        }
+    } catch {
+        Write-Host "  [WARN] Failed to copy log to network share: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
 }
 
 function Write-SectionHeader {
@@ -1238,6 +1258,7 @@ $preFlight = Invoke-PreFlightChecks
 if (-not $preFlight) {
     Write-Log "Pre-flight checks failed. Exiting." "ERROR"
     Write-Host "`n  Pre-flight checks failed. See log: $LogPath" -ForegroundColor Red
+    Copy-LogToNetworkShare
     exit 1
 }
 $phaseResults["Phase 1: Pre-Flight"] = "PASS"
@@ -1248,6 +1269,7 @@ $beforeHealth = Get-SCCMHealthScore
 if ($DiagnosticsOnly) {
     Write-Host "`n  -DiagnosticsOnly specified. No changes were made." -ForegroundColor Yellow
     Write-Log "DiagnosticsOnly mode -- exiting after Phase 2" "INFO"
+    Copy-LogToNetworkShare
     exit 0
 }
 
@@ -1255,6 +1277,7 @@ if ($beforeHealth.Score -eq 100 -and -not $ForceReinstall) {
     Write-Host "`n  Client is fully healthy (100 percent). No action needed." -ForegroundColor Green
     Write-Host "  Use -ForceReinstall to override.`n" -ForegroundColor Gray
     Write-Log "Client healthy. Exiting." "INFO"
+    Copy-LogToNetworkShare
     exit 0
 }
 $phaseResults["Phase 2: Diagnostics"] = "PASS"
@@ -1314,3 +1337,5 @@ Write-SummaryReport -BeforeHealth $beforeHealth -AfterHealth $afterHealth -Phase
 $elapsed = (Get-Date) - $startTime
 Write-Log "Total elapsed time: $($elapsed.ToString('hh\:mm\:ss'))" "INFO"
 Write-Host "  Total time: $($elapsed.ToString('hh\:mm\:ss'))`n" -ForegroundColor Gray
+
+Copy-LogToNetworkShare
