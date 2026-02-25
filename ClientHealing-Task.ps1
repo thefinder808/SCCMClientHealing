@@ -248,80 +248,110 @@ function Get-SCCMHealthScore {
 
     $passed = 0
     $total  = 0
+    $checkDetails = @()
 
     # CcmExec Service
     $total++
+    $checkStatus = "Fail"
+    $checkDetail = ""
     try {
         $svc = Get-Service -Name CcmExec -ErrorAction Stop
-        if ($svc.Status -eq "Running") { $passed++; Write-Log "CcmExec Service: Running" "SUCCESS" }
-        else { Write-Log "CcmExec Service: $($svc.Status)" "ERROR" }
-    } catch { Write-Log "CcmExec Service: Not found" "ERROR" }
+        if ($svc.Status -eq "Running") { $passed++; $checkStatus = "Pass"; $checkDetail = "CcmExec service is running"; Write-Log "CcmExec Service: Running" "SUCCESS" }
+        else { $checkDetail = "CcmExec service status: $($svc.Status)"; Write-Log "CcmExec Service: $($svc.Status)" "ERROR" }
+    } catch { $checkDetail = "CcmExec service not found"; Write-Log "CcmExec Service: Not found" "ERROR" }
+    $checkDetails += @{ Name = "CcmExec Service"; Category = "Client Service"; Status = $checkStatus; Weight = 10; Detail = $checkDetail; RemediationTier = 0 }
 
     # Client Version
     $total++
+    $checkStatus = "Fail"
+    $checkDetail = ""
     try {
         $client = Get-CimInstance -Namespace "root\ccm" -ClassName SMS_Client -ErrorAction Stop
-        $passed++; Write-Log "Client Version: $($client.ClientVersion)" "SUCCESS"
-    } catch { Write-Log "Client Version: Cannot query root\ccm" "ERROR" }
+        $passed++; $checkStatus = "Pass"; $checkDetail = "Client version: $($client.ClientVersion)"; Write-Log "Client Version: $($client.ClientVersion)" "SUCCESS"
+    } catch { $checkDetail = "Cannot query root\ccm"; Write-Log "Client Version: Cannot query root\ccm" "ERROR" }
+    $checkDetails += @{ Name = "Client Version"; Category = "Client Installation"; Status = $checkStatus; Weight = 10; Detail = $checkDetail; RemediationTier = 0 }
 
     # WMI Health
     $total++
+    $checkStatus = "Fail"
+    $checkDetail = ""
     try {
         Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop | Out-Null
-        $passed++; Write-Log "WMI Health: OK" "SUCCESS"
-    } catch { Write-Log "WMI Health: FAILED" "ERROR" }
+        $passed++; $checkStatus = "Pass"; $checkDetail = "WMI repository is healthy"; Write-Log "WMI Health: OK" "SUCCESS"
+    } catch { $checkDetail = "WMI query failed"; Write-Log "WMI Health: FAILED" "ERROR" }
+    $checkDetails += @{ Name = "WMI Health"; Category = "System Health"; Status = $checkStatus; Weight = 10; Detail = $checkDetail; RemediationTier = 0 }
 
     # SCCM WMI Namespaces (root\ccm is required; root\sms is optional on clients)
     $total++
+    $checkStatus = "Fail"
+    $checkDetail = ""
     $ccmNsOk = $true
     try { Get-CimInstance -Namespace "root\ccm" -ClassName "__NAMESPACE" -ErrorAction Stop | Out-Null }
     catch { $ccmNsOk = $false }
-    if ($ccmNsOk) { $passed++; Write-Log "SCCM WMI Namespaces: root\ccm present" "SUCCESS" }
-    else { Write-Log "SCCM WMI Namespaces: root\ccm missing" "ERROR" }
+    if ($ccmNsOk) { $passed++; $checkStatus = "Pass"; $checkDetail = "root\ccm namespace present"; Write-Log "SCCM WMI Namespaces: root\ccm present" "SUCCESS" }
+    else { $checkDetail = "root\ccm namespace missing"; Write-Log "SCCM WMI Namespaces: root\ccm missing" "ERROR" }
+    $checkDetails += @{ Name = "SCCM WMI Namespaces"; Category = "System Health"; Status = $checkStatus; Weight = 10; Detail = $checkDetail; RemediationTier = 0 }
 
     # BITS Service
     $total++
+    $checkStatus = "Fail"
+    $checkDetail = ""
     try {
         $bits = Get-Service -Name BITS -ErrorAction Stop
-        if ($bits.Status -eq "Running" -or $bits.StartType -ne "Disabled") { $passed++; Write-Log "BITS: $($bits.Status)/$($bits.StartType)" "SUCCESS" }
-        else { Write-Log "BITS: Disabled" "ERROR" }
-    } catch { Write-Log "BITS: Not found" "ERROR" }
+        if ($bits.Status -eq "Running" -or $bits.StartType -ne "Disabled") { $passed++; $checkStatus = "Pass"; $checkDetail = "BITS status: $($bits.Status)/$($bits.StartType)"; Write-Log "BITS: $($bits.Status)/$($bits.StartType)" "SUCCESS" }
+        else { $checkDetail = "BITS service is disabled"; Write-Log "BITS: Disabled" "ERROR" }
+    } catch { $checkDetail = "BITS service not found"; Write-Log "BITS: Not found" "ERROR" }
+    $checkDetails += @{ Name = "BITS Service"; Category = "System Services"; Status = $checkStatus; Weight = 10; Detail = $checkDetail; RemediationTier = 0 }
 
     # Windows Update Service
     $total++
+    $checkStatus = "Fail"
+    $checkDetail = ""
     try {
         $wu = Get-Service -Name wuauserv -ErrorAction Stop
-        if ($wu.StartType -ne "Disabled") { $passed++; Write-Log "WU: $($wu.Status)/$($wu.StartType)" "SUCCESS" }
-        else { Write-Log "WU: Disabled" "ERROR" }
-    } catch { Write-Log "WU: Not found" "ERROR" }
+        if ($wu.StartType -ne "Disabled") { $passed++; $checkStatus = "Pass"; $checkDetail = "Windows Update status: $($wu.Status)/$($wu.StartType)"; Write-Log "WU: $($wu.Status)/$($wu.StartType)" "SUCCESS" }
+        else { $checkDetail = "Windows Update service is disabled"; Write-Log "WU: Disabled" "ERROR" }
+    } catch { $checkDetail = "Windows Update service not found"; Write-Log "WU: Not found" "ERROR" }
+    $checkDetails += @{ Name = "Windows Update Service"; Category = "System Services"; Status = $checkStatus; Weight = 10; Detail = $checkDetail; RemediationTier = 0 }
 
     # Cryptographic Services
     $total++
+    $checkStatus = "Fail"
+    $checkDetail = ""
     try {
         $crypto = Get-Service -Name CryptSvc -ErrorAction Stop
-        if ($crypto.Status -eq "Running") { $passed++; Write-Log "CryptSvc: Running" "SUCCESS" }
-        else { Write-Log "CryptSvc: $($crypto.Status)" "ERROR" }
-    } catch { Write-Log "CryptSvc: Not found" "ERROR" }
+        if ($crypto.Status -eq "Running") { $passed++; $checkStatus = "Pass"; $checkDetail = "Cryptographic Services running"; Write-Log "CryptSvc: Running" "SUCCESS" }
+        else { $checkDetail = "Cryptographic Services status: $($crypto.Status)"; Write-Log "CryptSvc: $($crypto.Status)" "ERROR" }
+    } catch { $checkDetail = "Cryptographic Services not found"; Write-Log "CryptSvc: Not found" "ERROR" }
+    $checkDetails += @{ Name = "Cryptographic Services"; Category = "System Services"; Status = $checkStatus; Weight = 10; Detail = $checkDetail; RemediationTier = 0 }
 
     # SCCM Certificate
     $total++
+    $checkStatus = "Fail"
+    $checkDetail = ""
     try {
         $smsCerts = Get-ChildItem -Path "Cert:\LocalMachine\SMS" -ErrorAction Stop
         $validCerts = $smsCerts | Where-Object { $_.NotAfter -gt (Get-Date) }
-        if ($validCerts) { $passed++; Write-Log "SMS Certs: $($validCerts.Count) valid" "SUCCESS" }
-        else { Write-Log "SMS Certs: No valid certs" "ERROR" }
-    } catch { Write-Log "SMS Certs: Store not found" "ERROR" }
+        if ($validCerts) { $passed++; $checkStatus = "Pass"; $checkDetail = "$($validCerts.Count) valid SMS certificate(s)"; Write-Log "SMS Certs: $($validCerts.Count) valid" "SUCCESS" }
+        else { $checkDetail = "No valid SMS certificates"; Write-Log "SMS Certs: No valid certs" "ERROR" }
+    } catch { $checkDetail = "SMS certificate store not found"; Write-Log "SMS Certs: Store not found" "ERROR" }
+    $checkDetails += @{ Name = "SMS Certificates"; Category = "Security"; Status = $checkStatus; Weight = 10; Detail = $checkDetail; RemediationTier = 0 }
 
     # DNS Resolution
     $total++
+    $checkStatus = "Fail"
+    $checkDetail = ""
     $mpHostname = $ManagementPoint -replace '^https?://', ''
     try {
         Resolve-DnsName -Name $mpHostname -ErrorAction Stop | Out-Null
-        $passed++; Write-Log "DNS: Resolved $mpHostname" "SUCCESS"
-    } catch { Write-Log "DNS: Cannot resolve $mpHostname" "ERROR" }
+        $passed++; $checkStatus = "Pass"; $checkDetail = "Resolved $mpHostname"; Write-Log "DNS: Resolved $mpHostname" "SUCCESS"
+    } catch { $checkDetail = "Cannot resolve $mpHostname"; Write-Log "DNS: Cannot resolve $mpHostname" "ERROR" }
+    $checkDetails += @{ Name = "DNS Resolution"; Category = "Network"; Status = $checkStatus; Weight = 10; Detail = $checkDetail; RemediationTier = 0 }
 
     # ccmsetup.log (check last exit code only)
     $total++
+    $checkStatus = "Fail"
+    $checkDetail = ""
     $ccmsetupLog = "$env:SystemRoot\ccmsetup\Logs\ccmsetup.log"
     if (Test-Path $ccmsetupLog) {
         try {
@@ -329,20 +359,23 @@ function Get-SCCMHealthScore {
             $exitLine = $logContent | Select-String -Pattern "CcmSetup is exiting with return code (\d+)" | Select-Object -Last 1
             if ($exitLine) {
                 $exitCode = [int]$exitLine.Matches[0].Groups[1].Value
-                if ($exitCode -eq 0 -or $exitCode -eq 7) { $passed++; Write-Log "ccmsetup.log: Last exit code $exitCode (success)" "SUCCESS" }
-                else { Write-Log "ccmsetup.log: Last exit code $exitCode" "ERROR" }
+                if ($exitCode -eq 0 -or $exitCode -eq 7) { $passed++; $checkStatus = "Pass"; $checkDetail = "Last exit code $exitCode (success)"; Write-Log "ccmsetup.log: Last exit code $exitCode (success)" "SUCCESS" }
+                else { $checkDetail = "Last exit code $exitCode"; Write-Log "ccmsetup.log: Last exit code $exitCode" "ERROR" }
             } else {
-                $passed++; Write-Log "ccmsetup.log: No exit code line found" "INFO"
+                $passed++; $checkStatus = "Pass"; $checkDetail = "No exit code line found in log"; Write-Log "ccmsetup.log: No exit code line found" "INFO"
             }
         } catch {
-            Write-Log "ccmsetup.log: Could not read" "WARN"
+            $checkDetail = "Could not read ccmsetup.log"; Write-Log "ccmsetup.log: Could not read" "WARN"
         }
     } else {
-        $passed++; Write-Log "ccmsetup.log: Not present" "INFO"
+        $passed++; $checkStatus = "Pass"; $checkDetail = "ccmsetup.log not present (normal)"; Write-Log "ccmsetup.log: Not present" "INFO"
     }
+    $checkDetails += @{ Name = "ccmsetup.log Exit Code"; Category = "Client Installation"; Status = $checkStatus; Weight = 10; Detail = $checkDetail; RemediationTier = 0 }
 
     # MP Communication (CcmMessaging.log freshness)
     $total++
+    $checkStatus = "Fail"
+    $checkDetail = ""
     $ccmMsgLog = "$env:SystemRoot\CCM\Logs\CcmMessaging.log"
     $mpCommMaxDays = 7
     if (Test-Path $ccmMsgLog) {
@@ -357,30 +390,34 @@ function Get-SCCMHealthScore {
             }
             if ($lastTimestamp) {
                 $daysSince = ((Get-Date) - $lastTimestamp).Days
-                if ($daysSince -le $mpCommMaxDays) { $passed++; Write-Log "MP Communication: Last activity $daysSince day(s) ago" "SUCCESS" }
-                else { Write-Log "MP Communication: No activity for $daysSince days (threshold: $mpCommMaxDays)" "ERROR" }
-            } else { Write-Log "MP Communication: Could not parse timestamps" "WARN" }
-        } catch { Write-Log "MP Communication: Could not read log" "WARN" }
-    } else { Write-Log "MP Communication: CcmMessaging.log not found" "ERROR" }
+                if ($daysSince -le $mpCommMaxDays) { $passed++; $checkStatus = "Pass"; $checkDetail = "Last MP activity $daysSince day(s) ago"; Write-Log "MP Communication: Last activity $daysSince day(s) ago" "SUCCESS" }
+                else { $checkDetail = "No MP activity for $daysSince days (threshold: $mpCommMaxDays)"; Write-Log "MP Communication: No activity for $daysSince days (threshold: $mpCommMaxDays)" "ERROR" }
+            } else { $checkDetail = "Could not parse timestamps from CcmMessaging.log"; Write-Log "MP Communication: Could not parse timestamps" "WARN" }
+        } catch { $checkDetail = "Could not read CcmMessaging.log"; Write-Log "MP Communication: Could not read log" "WARN" }
+    } else { $checkDetail = "CcmMessaging.log not found"; Write-Log "MP Communication: CcmMessaging.log not found" "ERROR" }
+    $checkDetails += @{ Name = "MP Communication"; Category = "Network"; Status = $checkStatus; Weight = 10; Detail = $checkDetail; RemediationTier = 0 }
 
     # Client Assignment
     $total++
+    $checkStatus = "Fail"
+    $checkDetail = ""
     try {
         $regSite = (Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\SMS\Mobile Client" -Name "AssignedSiteCode" -ErrorAction Stop).AssignedSiteCode
-        if ($regSite -eq $SiteCode) { $passed++; Write-Log "Site Assignment: $regSite (correct)" "SUCCESS" }
-        else { Write-Log "Site Assignment: $regSite (expected $SiteCode)" "WARN" }
+        if ($regSite -eq $SiteCode) { $passed++; $checkStatus = "Pass"; $checkDetail = "Site code $regSite (correct)"; Write-Log "Site Assignment: $regSite (correct)" "SUCCESS" }
+        else { $checkDetail = "Site code $regSite (expected $SiteCode)"; Write-Log "Site Assignment: $regSite (expected $SiteCode)" "WARN" }
     } catch {
         try {
             $result = Invoke-CimMethod -Namespace "root\ccm" -ClassName SMS_Client -MethodName GetAssignedSite -ErrorAction Stop
-            if ($result.sSiteCode -eq $SiteCode) { $passed++; Write-Log "Site Assignment: $($result.sSiteCode) via WMI (correct)" "SUCCESS" }
-            else { Write-Log "Site Assignment: $($result.sSiteCode) via WMI (expected $SiteCode)" "WARN" }
-        } catch { Write-Log "Site Assignment: Cannot determine" "ERROR" }
+            if ($result.sSiteCode -eq $SiteCode) { $passed++; $checkStatus = "Pass"; $checkDetail = "Site code $($result.sSiteCode) via WMI (correct)"; Write-Log "Site Assignment: $($result.sSiteCode) via WMI (correct)" "SUCCESS" }
+            else { $checkDetail = "Site code $($result.sSiteCode) via WMI (expected $SiteCode)"; Write-Log "Site Assignment: $($result.sSiteCode) via WMI (expected $SiteCode)" "WARN" }
+        } catch { $checkDetail = "Cannot determine site assignment"; Write-Log "Site Assignment: Cannot determine" "ERROR" }
     }
+    $checkDetails += @{ Name = "Site Assignment"; Category = "Site Configuration"; Status = $checkStatus; Weight = 10; Detail = $checkDetail; RemediationTier = 0 }
 
     $score = [math]::Round(($passed / $total) * 100)
     Write-Log "Health Score: $($score)% ($($passed)/$($total))" "INFO"
 
-    return @{ Score = $score; Passed = $passed; Total = $total }
+    return @{ Score = $score; Passed = $passed; Total = $total; CheckDetails = $checkDetails }
 }
 
 # ============================================================================
