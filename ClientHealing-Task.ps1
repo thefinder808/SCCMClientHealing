@@ -157,7 +157,8 @@ function Copy-LogToNetworkShare {
         if (-not (Test-Path $destDir)) {
             New-Item -Path $destDir -ItemType Directory -Force | Out-Null
         }
-        foreach ($file in @($LogPath, $transcriptPath, $StateFile)) {
+        $healthStatusLocal = Join-Path $LocalStagingDir "HealthStatus.json"
+        foreach ($file in @($LogPath, $transcriptPath, $StateFile, $healthStatusLocal)) {
             if ($file -and (Test-Path $file)) {
                 Copy-Item -Path $file -Destination $destDir -Force -ErrorAction Stop
             }
@@ -1146,6 +1147,8 @@ if ($healthResult.Score -eq 100) {
 
     Write-Log "Client healthy. Consecutive successes: $($state.ConsecutiveSuccesses) of $ConsecutiveSuccessThreshold required" "SUCCESS"
     Write-State -State $state
+    Write-HealthStatus -HealthResult $healthResult -RemediationTier 0 -RemediationResult "None" -ClientVersion $(if ($state.ClientVersion) { $state.ClientVersion } else { "" })
+    Write-HealthHistory -HealthScore $healthResult.Score -RemediationTier 0 -RemediationResult "None"
 
     # Check if this success pushes us over the threshold
     if ($state.ConsecutiveSuccesses -ge $ConsecutiveSuccessThreshold) {
@@ -1170,6 +1173,8 @@ $state.LastHealthScore = $healthResult.Score
 if (-not (Wait-ForNetwork)) {
     Write-Log "Network unavailable. Will retry on next scheduled run." "ERROR"
     Write-State -State $state
+    Write-HealthStatus -HealthResult $healthResult -RemediationTier 0 -RemediationResult "Network unavailable - healing deferred" -ClientVersion ""
+    Write-HealthHistory -HealthScore $healthResult.Score -RemediationTier 0 -RemediationResult "Network unavailable - healing deferred"
     $elapsed = (Get-Date) - $startTime
     Write-Log "Total elapsed time: $($elapsed.ToString('hh\:mm\:ss'))" "INFO"
     Write-Log "========================================" "PHASE"
@@ -1202,18 +1207,26 @@ if ($installSuccess) {
             $state.ConsecutiveSuccesses = 1
             $state.LastHealthScore = $afterHealth.Score
             $state.ClientVersion = $afterHealth.ClientVersion
+            Write-HealthStatus -HealthResult $healthResult -RemediationTier 3 -RemediationResult "Full client rebuild succeeded" -ClientVersion $(if ($afterHealth.ClientVersion) { $afterHealth.ClientVersion } else { "" })
+            Write-HealthHistory -HealthScore $afterHealth.Score -RemediationTier 3 -RemediationResult "Full client rebuild succeeded"
         } else {
             Write-Log "HEALING PARTIAL -- Score: $($afterHealth.Score)%. Will retry on next scheduled run." "WARN"
             $state.ConsecutiveSuccesses = 0
             $state.LastHealthScore = $afterHealth.Score
+            Write-HealthStatus -HealthResult $healthResult -RemediationTier 3 -RemediationResult "Full client rebuild - partial recovery" -ClientVersion ""
+            Write-HealthHistory -HealthScore $afterHealth.Score -RemediationTier 3 -RemediationResult "Full client rebuild - partial recovery"
         }
     } catch {
         Write-Log "Post-install verification error: $($_.Exception.Message)" "ERROR"
         $state.ConsecutiveSuccesses = 0
+        Write-HealthStatus -HealthResult $healthResult -RemediationTier 3 -RemediationResult "Post-install verification failed" -ClientVersion ""
+        Write-HealthHistory -HealthScore $healthResult.Score -RemediationTier 3 -RemediationResult "Post-install verification failed"
     }
 } else {
     Write-Log "INSTALLATION FAILED. Will retry on next scheduled run." "ERROR"
     $state.ConsecutiveSuccesses = 0
+    Write-HealthStatus -HealthResult $healthResult -RemediationTier 3 -RemediationResult "Client installation failed" -ClientVersion ""
+    Write-HealthHistory -HealthScore $healthResult.Score -RemediationTier 3 -RemediationResult "Client installation failed"
 }
 
 Write-State -State $state
