@@ -222,6 +222,113 @@ function Write-State {
 }
 
 # ============================================================================
+#  GUI-COMPATIBLE REPORTING (ConfigMgrHealthAgent-GUI Fleet Dashboard)
+# ============================================================================
+
+function Get-HealthStatusText {
+    param([int]$Score)
+    if ($Score -eq 100) { return "Healthy" }
+    elseif ($Score -ge 75) { return "Degraded" }
+    else { return "Critical" }
+}
+
+function Write-HealthStatus {
+    param(
+        [hashtable]$HealthResult,
+        [int]$RemediationTier = 0,
+        [string]$RemediationResult = "None",
+        [string]$ClientVersion = ""
+    )
+
+    $statusText = Get-HealthStatusText -Score $HealthResult.Score
+
+    $status = [ordered]@{
+        ComputerName      = $env:COMPUTERNAME
+        HealthScore       = $HealthResult.Score
+        HealthStatus      = $statusText
+        ChecksPassed      = $HealthResult.Passed
+        ChecksFailed      = $HealthResult.Total - $HealthResult.Passed
+        ChecksTotal       = $HealthResult.Total
+        RemediationTier   = $RemediationTier
+        RemediationResult = $RemediationResult
+        ClientVersion     = $ClientVersion
+        SiteCode          = $SiteCode
+        AgentVersion      = "1.0.0-SCCMHealing"
+        LastCheckTime     = (Get-Date).ToString("o")
+        CheckDetails      = $HealthResult.CheckDetails
+    }
+
+    $json = $status | ConvertTo-Json -Depth 3
+
+    # Write local copy
+    $localPath = Join-Path $LocalStagingDir "HealthStatus.json"
+    try {
+        Set-Content -Path $localPath -Value $json -Force -ErrorAction Stop
+        Write-Log "HealthStatus.json written locally" "INFO"
+    } catch {
+        Write-Log "Failed to write local HealthStatus.json: $($_.Exception.Message)" "WARN"
+    }
+
+    # Write to network share
+    if ($NetworkLogShare -and $NetworkLogShare -notmatch '\\\\SERVER\\Share') {
+        try {
+            $destDir = Join-Path $NetworkLogShare $env:COMPUTERNAME
+            if (-not (Test-Path $destDir)) {
+                New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+            }
+            $netPath = Join-Path $destDir "HealthStatus.json"
+            Set-Content -Path $netPath -Value $json -Force -ErrorAction Stop
+            Write-Log "HealthStatus.json written to network share" "INFO"
+        } catch {
+            Write-Log "Failed to write network HealthStatus.json: $($_.Exception.Message)" "WARN"
+        }
+    }
+}
+
+function Write-HealthHistory {
+    param(
+        [int]$HealthScore,
+        [int]$RemediationTier = 0,
+        [string]$RemediationResult = "None"
+    )
+
+    $statusText = Get-HealthStatusText -Score $HealthScore
+
+    $entry = [ordered]@{
+        Timestamp         = (Get-Date).ToString("o")
+        HealthScore       = $HealthScore
+        HealthStatus      = $statusText
+        RemediationTier   = $RemediationTier
+        RemediationResult = $RemediationResult
+    }
+
+    $jsonLine = $entry | ConvertTo-Json -Compress
+
+    # Append to network share (JSONL is append-only, write directly to share)
+    if ($NetworkLogShare -and $NetworkLogShare -notmatch '\\\\SERVER\\Share') {
+        try {
+            $destDir = Join-Path $NetworkLogShare $env:COMPUTERNAME
+            if (-not (Test-Path $destDir)) {
+                New-Item -Path $destDir -ItemType Directory -Force | Out-Null
+            }
+            $histPath = Join-Path $destDir "HealthHistory.jsonl"
+            Add-Content -Path $histPath -Value $jsonLine -ErrorAction Stop
+            Write-Log "HealthHistory.jsonl entry appended" "INFO"
+        } catch {
+            Write-Log "Failed to append HealthHistory.jsonl: $($_.Exception.Message)" "WARN"
+        }
+    }
+
+    # Also append to local copy
+    $localHistPath = Join-Path $LocalStagingDir "HealthHistory.jsonl"
+    try {
+        Add-Content -Path $localHistPath -Value $jsonLine -ErrorAction Stop
+    } catch {
+        Write-Log "Failed to append local HealthHistory.jsonl: $($_.Exception.Message)" "WARN"
+    }
+}
+
+# ============================================================================
 #  NETWORK WAIT
 # ============================================================================
 
